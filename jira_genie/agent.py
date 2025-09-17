@@ -230,6 +230,7 @@ root_agent = LlmAgent(
 
   3. ProjectHealthAgent
      - Purpose: Monitor and forecast team/project health.
+     - Requirement: Ask or get a project key from the user.
      - Capabilities:
        - Run predictive risk analysis using historical Jira data.
        - Detect velocity trends and forecast performance for upcoming sprints.

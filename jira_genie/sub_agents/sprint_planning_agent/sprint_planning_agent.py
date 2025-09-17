@@ -1,22 +1,583 @@
 from google.adk.agents import LlmAgent
+from google.adk.tools import FunctionTool
+import numpy as np
+import pandas as pd
+from datetime import datetime, timedelta
+from sklearn.linear_model import LinearRegression
+from sklearn.ensemble import RandomForestRegressor
+import json
+from typing import Optional, List, Dict, TypedDict
 
-sprint_planning_agent = LlmAgent(
-  name="sprint_planning_agent",
-  model="gemini-2.0-flash",
-  description="AI agent for intelligent sprint planning with velocity prediction and optimal story distribution",
-  instruction="""You are an expert sprint planning agent with advanced ML capabilities. Your expertise includes:
-
-  1. VELOCITY PREDICTION: Use machine learning to predict team velocity based on historical data and current factors
-  2. OPTIMAL DISTRIBUTION: Balance story points across different types of work for maximum team efficiency  
-  3. RISK ASSESSMENT: Identify potential sprint risks and provide mitigation strategies
-
-  Key capabilities:
-  - Analyze historical sprint data to predict future performance
-  - Optimize story selection based on capacity and priorities
-  - Balance bugs, features, and technical tasks
-  - Consider team size, complexity, and external factors
-  - Provide data-driven recommendations for sprint success
-
-  Always provide confidence intervals and explain the reasoning behind predictions.""",
-  #tools=[create_sprint, update_sprint, manage_sprint],
-)
+from ...utils.jira_connector import JiraConnector
+ 
+ 
+class SprintPlanningAgent:
+    def fetch_jira_backlog_items(self, project_key: str) -> list:
+        """
+        Fetch all backlog tasks from JIRA for a given project and convert them to the required format for sprint planning.
+        project_key: JIRA project key (e.g., SCRUM)
+        Returns: List of dicts with keys: story_points, type, priority_score, complexity, dependencies
+        """
+        if not self.jira:
+            return []
+        try:
+            jql_query = f'project = {project_key} AND sprint IS EMPTY AND status IN ("To Do", "Open")'
+            issues = self.jira.search_issues(jql_query, maxResults=1000)
+            backlog_items = []
+            for issue in issues:
+                fields = issue.fields
+                # Extract fields, adjust field names as per your JIRA config
+                story_points = getattr(fields, 'customfield_10016', 0)  # Change customfield_10016 to your Story Points field
+                issue_type = getattr(fields.issuetype, 'name', 'task').lower()
+                priority_score = getattr(fields.priority, 'id', 2)  # Use priority id or map as needed
+                complexity = getattr(fields, 'complexity', 'medium')  # Adjust if you have a custom field
+                dependencies = len(getattr(fields, 'issuelinks', []))
+                backlog_items.append({
+                    'story_points': int(story_points) if story_points else 0,
+                    'type': issue_type,
+                    'priority_score': int(priority_score),
+                    'complexity': str(complexity).lower(),
+                    'dependencies': dependencies
+                })
+            return backlog_items
+        except Exception as e:
+            return []
+    """
+    AI-powered Sprint Planning Agent
+    - Velocity prediction using machine learning
+    - Optimal story point distribution
+    - Risk-balanced sprint composition
+    """
+ 
+    def __init__(self):
+        self.jira = JiraConnector.getConnection()
+ 
+        # Historical sprint data (in real implementation, load from database)
+        # Fetch historical sprint data from JIRA if connector is provided, else use empty/default
+        if self.jira:
+            try:
+                self.historical_data = self.jira.get_historical_sprint_data()
+            except Exception:
+                self.historical_data = {'sprints': []}
+        else:
+            self.historical_data = {'sprints': []}
+ 
+        # Team velocity patterns
+        self.team_metrics = {
+            'average_velocity': 43.6,
+            'velocity_std': 4.2,
+            'completion_rate': 0.89,
+            'bug_impact_factor': 0.95,
+            'feature_complexity_factor': 1.1
+        }
+ 
+    def predict_velocity(self, team_size: int, planned_story_types: dict, external_factors: Optional[dict]) -> dict:
+        """Predict sprint velocity using ML algorithms"""
+        try:
+            # Prepare historical data for ML
+            df = pd.DataFrame(self.historical_data['sprints'])
+ 
+            # Feature engineering
+            df['bug_ratio'] = df['bugs'] / (df['bugs'] + df['features'] + df['tasks'])
+            df['feature_ratio'] = df['features'] / (df['bugs'] + df['features'] + df['tasks'])
+            df['task_ratio'] = df['tasks'] / (df['bugs'] + df['features'] + df['tasks'])
+            df['points_per_person'] = df['planned_points'] / df['team_size']
+            df['completion_ratio'] = df['completed_points'] / df['planned_points']
+ 
+            # Features for prediction
+            features = ['team_size', 'bug_ratio', 'feature_ratio', 'task_ratio', 'points_per_person']
+            X = df[features]
+            y = df['completion_ratio']
+ 
+            # Train models
+            linear_model = LinearRegression()
+            rf_model = RandomForestRegressor(n_estimators=10, random_state=42)
+ 
+            linear_model.fit(X, y)
+            rf_model.fit(X, y)
+ 
+            # Prepare prediction data
+            total_items = sum(planned_story_types.values())
+            if total_items == 0:
+                total_items = 1
+ 
+            pred_data = {
+                'team_size': team_size,
+                'bug_ratio': planned_story_types.get('bugs', 0) / total_items,
+                'feature_ratio': planned_story_types.get('features', 0) / total_items,
+                'task_ratio': planned_story_types.get('tasks', 0) / total_items,
+                'points_per_person': (planned_story_types.get('total_points', 50)) / team_size
+            }
+ 
+            pred_df = pd.DataFrame([pred_data])
+ 
+            # Make predictions
+            linear_pred = linear_model.predict(pred_df)[0]
+            rf_pred = rf_model.predict(pred_df)[0]
+ 
+            # Ensemble prediction (weighted average)
+            ensemble_pred = 0.6 * rf_pred + 0.4 * linear_pred
+ 
+            # Apply external factors
+            external_factor = 1.0
+            if external_factors:
+                if external_factors.get('holidays', 0) > 0:
+                    external_factor *= (1 - external_factors['holidays'] * 0.1)  # 10% reduction per holiday
+                if external_factors.get('new_team_members', 0) > 0:
+                    external_factor *= 0.9  # 10% reduction for new members
+                if external_factors.get('technical_debt', False):
+                    external_factor *= 0.85  # 15% reduction for technical debt
+ 
+            final_completion_ratio = ensemble_pred * external_factor
+            predicted_velocity = planned_story_types.get('total_points', 50) * final_completion_ratio
+ 
+            # Calculate confidence interval
+            std_dev = np.std([linear_pred, rf_pred])
+            confidence_lower = max(0, predicted_velocity - std_dev * predicted_velocity)
+            confidence_upper = predicted_velocity + std_dev * predicted_velocity
+ 
+            return {
+                'predicted_velocity': round(predicted_velocity, 1),
+                'completion_probability': round(final_completion_ratio * 100, 1),
+                'confidence_range': {
+                    'lower': round(confidence_lower, 1),
+                    'upper': round(confidence_upper, 1)
+                },
+                'model_predictions': {
+                    'linear_regression': round(linear_pred * planned_story_types.get('total_points', 50), 1),
+                    'random_forest': round(rf_pred * planned_story_types.get('total_points', 50), 1),
+                    'ensemble': round(ensemble_pred * planned_story_types.get('total_points', 50), 1)
+                },
+                'external_impact': round((1 - external_factor) * 100, 1),
+                'recommendation': self._get_velocity_recommendation(final_completion_ratio)
+            }
+ 
+        except Exception as e:
+            return {
+                'predicted_velocity': self.team_metrics['average_velocity'],
+                'error': str(e),
+                'fallback': True
+            }
+ 
+    def _get_velocity_recommendation(self, completion_ratio: float) -> str:
+        """Get recommendation based on predicted completion ratio"""
+        if completion_ratio >= 0.95:
+            return "Excellent capacity utilization. Consider adding stretch goals."
+        elif completion_ratio >= 0.85:
+            return "Good sprint capacity. Plan looks achievable."
+        elif completion_ratio >= 0.70:
+            return "Moderate risk. Consider reducing scope or complexity."
+        else:
+            return "High risk of incomplete sprint. Recommend significant scope reduction."
+ 
+ 
+    def optimize_story_distribution(self, backlog_items: List[Dict[str, object]], team_capacity: int, sprint_duration: int = 2) -> dict:
+        """
+        backlog_items: a Python list of dicts, each item with keys:
+            - story_points (int)
+            - type (str)
+            - priority_score (int)
+            - complexity (str) -> expected 'simple'|'medium'|'complex'
+            - dependencies (int)
+        """
+        try:
+            if not isinstance(backlog_items, list):
+                return {'error': 'backlog_items must be a Python list of dicts', 'fallback_capacity': team_capacity}
+ 
+            # --- Normalize + validate items ---
+            normalized = []
+            for idx, it in enumerate(backlog_items):
+                if not isinstance(it, dict):
+                    return {'error': f'backlog_items[{idx}] is not an object/dict', 'fallback_capacity': team_capacity}
+                normalized.append({
+                    'story_points': int(it.get('story_points', 0) or 0),
+                    'type': str(it.get('type', 'other') or 'other').lower(),
+                    'priority_score': int(it.get('priority_score', 0) or 0),
+                    'complexity': str(it.get('complexity', 'medium') or 'medium').lower(),
+                    'dependencies': int(it.get('dependencies', 0) or 0),
+                    # preserve original item for return if you want
+                    '_orig': it
+                })
+ 
+            # --- Sort: highest priority first; for same priority prefer smaller or larger story points
+            # Current behavior: sort by (priority_score desc, story_points asc)
+            sorted_items = sorted(
+                normalized,
+                key=lambda x: (x['priority_score'], -x['story_points']),
+                reverse=True
+            )
+ 
+            selected_items: List[Dict] = []
+            total_points = 0
+            risk_score = 0.0
+ 
+            story_types = {'bugs': 0, 'features': 0, 'tasks': 0, 'other': 0}
+            complexity_distribution = {'simple': 0, 'medium': 0, 'complex': 0}
+ 
+            # helper fallbacks
+            has_calc_risk = hasattr(self, '_calculate_item_risk')
+            has_balance = hasattr(self, '_analyze_sprint_balance')
+            has_get_risk_level = hasattr(self, '_get_risk_level')
+            has_recs = hasattr(self, '_get_distribution_recommendations')
+ 
+            for item in sorted_items:
+                sp = item['story_points']
+                itype = item['type']
+                comp = item['complexity']
+                deps = item['dependencies']
+ 
+                if total_points + sp <= team_capacity:
+                    selected_items.append(item)
+                    total_points += sp
+ 
+                    # type counting
+                    if itype in story_types:
+                        story_types[itype] += 1
+                    else:
+                        # map common synonyms
+                        if itype == 'bug':
+                            story_types['bugs'] += 1
+                        elif itype in ('story', 'feature', 'enhancement', 'new feature'):
+                            story_types['features'] += 1
+                        elif itype in ('task', 'sub-task', 'subtask'):
+                            story_types['tasks'] += 1
+                        else:
+                            story_types['other'] += 1
+ 
+                    # complexity distribution normalize to our keys
+                    if comp in ('simple', 'easy', 'small'):
+                        complexity_distribution['simple'] += 1
+                        complexity_key = 'simple'
+                    elif comp in ('complex', 'hard', 'large'):
+                        complexity_distribution['complex'] += 1
+                        complexity_key = 'complex'
+                    else:
+                        complexity_distribution['medium'] += 1
+                        complexity_key = 'medium'
+ 
+                    # item risk
+                    if has_calc_risk:
+                        try:
+                            item_risk = float(self._calculate_item_risk(item))
+                        except Exception:
+                            item_risk = 0.0
+                    else:
+                        # fallback heuristic: complexity weight + dependency factor + SP relative term
+                        comp_weight = {'simple': 0.5, 'medium': 1.0, 'complex': 2.0}.get(complexity_key, 1.0)
+                        dep_weight = deps * 0.5
+                        size_weight = sp / max(1, team_capacity)  # small contribution
+                        item_risk = comp_weight + dep_weight + size_weight
+ 
+                    risk_score += item_risk
+ 
+            # --- Balance analysis (use helper if available) ---
+            if has_balance:
+                try:
+                    balance_score = self._analyze_sprint_balance(story_types, complexity_distribution, total_points, team_capacity)
+                except Exception:
+                    balance_score = {'score': 0, 'note': 'balance analyzer failed'}
+            else:
+                # Simple fallback balance: closer to balanced counts and <= capacity => good score
+                type_counts = [v for k, v in story_types.items() if k != 'other']
+                type_variation = 0.0
+                if type_counts:
+                    mean_count = sum(type_counts) / len(type_counts)
+                    type_variation = sum(abs(c - mean_count) for c in type_counts) / max(1.0, mean_count)
+                capacity_ratio = (total_points / team_capacity) if team_capacity > 0 else 0
+                balance_score = {'score': round(100 - min(100, type_variation * 10 + abs(0.8 - capacity_ratio) * 100), 1)}
+ 
+            # --- Risk aggregation and level ---
+            selected_count = len(selected_items)
+            overall_risk = round((risk_score / selected_count), 2) if selected_count else 0.0
+ 
+            if has_get_risk_level:
+                try:
+                    risk_level = self._get_risk_level(overall_risk)
+                except Exception:
+                    risk_level = 'medium'
+            else:
+                # simple mapping
+                if overall_risk >= 2.0:
+                    risk_level = 'high'
+                elif overall_risk >= 1.0:
+                    risk_level = 'medium'
+                else:
+                    risk_level = 'low'
+ 
+            # --- Recommendations ---
+            if has_recs:
+                try:
+                    recommendations = self._get_distribution_recommendations(story_types, complexity_distribution, total_points, team_capacity)
+                except Exception:
+                    recommendations = []
+            else:
+                recommendations = []
+                if total_points > team_capacity:
+                    recommendations.append("Selected items exceed capacity — deprioritize low-priority items or split stories.")
+                else:
+                    recommendations.append("Plan fits within capacity; keep an eye on complex items and dependencies.")
+                if complexity_distribution['complex'] > max(1, selected_count * 0.25):
+                    recommendations.append("Too many complex items — consider moving some to next sprint or breaking them down.")
+ 
+            # --- Capacity utilization safe calc ---
+            capacity_utilization = round((total_points / team_capacity) * 100, 1) if team_capacity > 0 else 0.0
+ 
+            # Build output (strip internal _orig if you prefer)
+            # Optionally return the original items for traceability
+            output_selected = [ {k: v for k, v in s.items() if k != '_orig'} for s in selected_items ]
+ 
+            return {
+                'selected_items': output_selected,
+                'total_story_points': total_points,
+                'capacity_utilization': capacity_utilization,
+                'story_distribution': story_types,
+                'complexity_distribution': complexity_distribution,
+                'risk_assessment': {
+                    'overall_risk': overall_risk,
+                    'risk_level': risk_level
+                },
+                'balance_score': balance_score,
+                'recommendations': recommendations
+            }
+ 
+        except Exception as e:
+            return {
+                'error': str(e),
+                'fallback_capacity': team_capacity
+            }
+ 
+    def _calculate_item_risk(self, item: dict) -> float:
+        """Calculate risk score for individual item"""
+        base_risk = 0.1
+ 
+        # Complexity factor
+        complexity_factors = {'simple': 0.1, 'medium': 0.3, 'complex': 0.6}
+        complexity_risk = complexity_factors.get(item.get('complexity', 'medium').lower(), 0.3)
+ 
+        # Dependency factor
+        dependency_risk = min(0.4, item.get('dependencies', 0) * 0.1)
+ 
+        # Story points factor (higher points = higher risk)
+        points_risk = min(0.3, item.get('story_points', 0) * 0.05)
+ 
+        return base_risk + complexity_risk + dependency_risk + points_risk
+ 
+    def _analyze_sprint_balance(self, story_types: dict, complexity_dist: dict, total_points: int, capacity: int) -> dict:
+        """Analyze sprint balance and composition"""
+        total_items = sum(story_types.values())
+ 
+        # Ideal ratios
+        ideal_ratios = {'bugs': 0.2, 'features': 0.6, 'tasks': 0.2}
+ 
+        balance_score = 100
+        issues = []
+ 
+        if total_items > 0:
+            for story_type, ideal_ratio in ideal_ratios.items():
+                actual_ratio = story_types.get(story_type, 0) / total_items
+                deviation = abs(actual_ratio - ideal_ratio)
+ 
+                if deviation > 0.2:  # 20% deviation threshold
+                    balance_score -= deviation * 50
+                    issues.append(f"Imbalanced {story_type} ratio: {actual_ratio:.1%} vs ideal {ideal_ratio:.1%}")
+ 
+        # Complexity balance check
+        total_complexity = sum(complexity_dist.values())
+        if total_complexity > 0:
+            complex_ratio = complexity_dist.get('complex', 0) / total_complexity
+            if complex_ratio > 0.4:  # More than 40% complex items
+                balance_score -= 20
+                issues.append(f"Too many complex items: {complex_ratio:.1%}")
+ 
+        return {
+            'score': max(0, round(balance_score)),
+            'issues': issues,
+            'recommendations': self._get_balance_recommendations(issues)
+        }
+ 
+    def _get_balance_recommendations(self, issues: list) -> list:
+        """Generate recommendations based on balance issues"""
+        recommendations = []
+ 
+        for issue in issues:
+            if 'bugs' in issue.lower():
+                recommendations.append("Consider deferring non-critical bugs to next sprint")
+            elif 'features' in issue.lower():
+                recommendations.append("Balance feature development with technical debt")
+            elif 'complex' in issue.lower():
+                recommendations.append("Mix complex items with simpler ones for better flow")
+ 
+        return recommendations
+ 
+    def _get_risk_level(self, risk_score: float) -> str:
+        """Convert risk score to risk level"""
+        if risk_score <= 0.3:
+            return "Low"
+        elif risk_score <= 0.5:
+            return "Medium"
+        else:
+            return "High"
+ 
+    def _get_distribution_recommendations(self, story_types: dict, complexity_dist: dict, total_points: int, capacity: int) -> list:
+        """Generate distribution recommendations"""
+        recommendations = []
+        utilization = (total_points / capacity) * 100
+ 
+        if utilization < 70:
+            recommendations.append("Consider adding more items to fully utilize team capacity")
+        elif utilization > 95:
+            recommendations.append("Sprint is at high capacity - consider buffer for unexpected work")
+ 
+        total_items = sum(story_types.values())
+        if total_items > 0:
+            bug_ratio = story_types.get('bugs', 0) / total_items
+            if bug_ratio > 0.4:
+                recommendations.append("High bug ratio detected - consider technical debt sprint")
+ 
+        return recommendations
+ 
+ 
+ 
+    def create_sprint_plan(self,
+                        project_key: str,
+                        team_size: int = 5,
+                        external_factors: Optional[dict] = None,
+                        sprint_goal: str = "") -> dict:
+        """
+        Always fetches backlog from JIRA for the given project key (status and resolution are always the same).
+        Returns a sprint_plan dict.
+        """
+        try:
+            backlog_items = self.fetch_jira_backlog_items(project_key)
+            if not isinstance(backlog_items, list):
+                return {'error': 'Failed to fetch backlog from JIRA', 'status': 'sprint_planning_failed'}
+ 
+            # validate each item is a dict and normalize missing fields
+            normalized_items = []
+            for idx, item in enumerate(backlog_items):
+                if not isinstance(item, dict):
+                    return {'error': f'backlog_items[{idx}] is not an object/dict', 'status': 'sprint_planning_failed'}
+                normalized_items.append({
+                    'story_points': int(item.get('story_points', 0)),
+                    'type': str(item.get('type', 'other')).lower(),
+                    'priority_score': int(item.get('priority_score', 0)),
+                    'complexity': item.get('complexity', None),
+                    'dependencies': int(item.get('dependencies', 0))
+                })
+ 
+            # --- Step 1: Calculate team capacity ---
+            base_capacity_per_person = 8  # story points per person per sprint (tweakable)
+            team_capacity = team_size * base_capacity_per_person
+ 
+            # --- Step 2: Analyze story types and total points ---
+            story_type_counts = {'bugs': 0, 'features': 0, 'tasks': 0, 'total_points': 0}
+            for item in normalized_items:
+                item_type = item['type']
+                if item_type in story_type_counts:
+                    story_type_counts[item_type] += 1
+                # Map synonyms
+                elif item_type in ('bug',):
+                    story_type_counts['bugs'] += 1
+                elif item_type in ('story', 'feature', 'enhancement', 'new feature'):
+                    story_type_counts['features'] += 1
+                elif item_type in ('task', 'sub-task', 'subtask'):
+                    story_type_counts['tasks'] += 1
+                story_type_counts['total_points'] += item['story_points']
+ 
+            # --- Step 3: Predict velocity (call your model/helper) ---
+            # Ensure predict_velocity exists on self; stub below if not
+            velocity_prediction = self.predict_velocity(team_size, story_type_counts, external_factors)
+ 
+            # --- Step 4: Optimize distribution ---
+            distribution_result = self.optimize_story_distribution(normalized_items, team_capacity)
+ 
+            # --- Step 5: Compose sprint plan ---
+            sprint_plan = {
+                'sprint_metadata': {
+                    'created_at': datetime.now().isoformat(),
+                    'team_size': team_size,
+                    'sprint_goal': sprint_goal,
+                    'duration_weeks': 2
+                },
+                'backlog_ticket_count': len(backlog_items),
+                'capacity_analysis': {
+                    'team_capacity': team_capacity,
+                    'predicted_velocity': velocity_prediction.get('predicted_velocity'),
+                    'utilization_target': 85  # Target 85% utilization
+                },
+                'velocity_prediction': velocity_prediction,
+                'story_distribution': distribution_result,
+                'success_probability': velocity_prediction.get('completion_probability', 75),
+                'recommendations': self._generate_sprint_recommendations(velocity_prediction, distribution_result),
+                'risk_mitigation': self._generate_risk_mitigation_plan(distribution_result.get('risk_assessment', {}))
+            }
+ 
+            return sprint_plan
+ 
+        except Exception as e:
+            return {'error': str(e), 'status': 'sprint_planning_failed'}
+       
+ 
+    def _generate_sprint_recommendations(self, velocity_pred: dict, distribution: dict) -> list:
+        """Generate comprehensive sprint recommendations"""
+        recommendations = []
+ 
+        completion_prob = velocity_pred.get('completion_probability', 0)
+        if completion_prob < 70:
+            recommendations.append("⚠️ Low completion probability - consider reducing scope")
+        elif completion_prob > 95:
+            recommendations.append("✅ High completion probability - consider stretch goals")
+ 
+        risk_level = distribution.get('risk_assessment', {}).get('risk_level', 'Medium')
+        if risk_level == 'High':
+            recommendations.append("🔴 High risk sprint - add buffer time and simplify complex items")
+        elif risk_level == 'Low':
+            recommendations.append("🟢 Well-balanced sprint composition")
+ 
+        return recommendations
+ 
+    def _generate_risk_mitigation_plan(self, risk_assessment: dict) -> list:
+        """Generate risk mitigation strategies"""
+        mitigation_plan = []
+ 
+        risk_level = risk_assessment.get('risk_level', 'Medium')
+        overall_risk = risk_assessment.get('overall_risk', 0)
+ 
+        if risk_level == 'High' or overall_risk > 0.5:
+            mitigation_plan.extend([
+                "Schedule daily check-ins for complex items",
+                "Identify dependencies early and create blockers",
+                "Have backup stories ready in case of scope reduction",
+                "Pair programming for high-risk items"
+            ])
+ 
+        return mitigation_plan
+ 
+    def get_agent(self):
+        """Return the ADK agent configuration"""
+        return LlmAgent(  
+            name="sprint_planning_agent",
+            model="gemini-2.0-flash",
+            description="AI agent for intelligent sprint planning with velocity prediction and optimal story distribution",
+            instruction="""You are an expert sprint planning agent with advanced ML capabilities. Your expertise includes:
+ 
+            1. VELOCITY PREDICTION: Use machine learning to predict team velocity based on historical data and current factors
+            2. OPTIMAL DISTRIBUTION: Balance story points across different types of work for maximum team efficiency  
+            3. RISK ASSESSMENT: Identify potential sprint risks and provide mitigation strategies
+ 
+            Key capabilities:
+            - Analyze historical sprint data to predict future performance
+            - Optimize story selection based on capacity and priorities
+            - Balance bugs, features, and technical tasks
+            - Consider team size, complexity, and external factors
+            - Provide data-driven recommendations for sprint success
+ 
+            Always provide confidence intervals and explain the reasoning behind predictions.""",
+            tools=[
+                FunctionTool(self.predict_velocity),
+                FunctionTool(self.optimize_story_distribution),
+                FunctionTool(self.create_sprint_plan)
+            ]
+        )
+    
+sprint_planning_agent = SprintPlanningAgent().get_agent()
