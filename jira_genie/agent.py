@@ -31,21 +31,34 @@ def fetch_projects() -> list[dict]:
   ]
 
 def fetch_issues(
-  jql: str,
-  max_results: int,
+  jql_query: str,
 ) -> list[dict]:
   """
   Fetch issues from Jira based on JQL query such as project key or assignee.
   Args:
-    jql (str): The JQL query string to filter issues.
+    jql_query (str): The JQL query string to filter issues.
     max_results (int): Maximum number of issues to fetch.
     project_key (Optional[str]): The project key to filter issues (if any).
-    username (Optional[str]): The username to filter issues assigned to a specific user (if any).
   Returns: 
     list[dict]: A list of dictionaries containing issue details.
   """
-  print(jql)
-  issues = jira.search_issues(jql, maxResults=max_results)
+  print(jql_query)
+  issues = []
+  next_token = None
+
+  while True:
+    resp = jira.enhanced_search_issues(
+      jql_str=jql_query,
+      nextPageToken=next_token,
+      maxResults=100,
+      json_result=True  # returns raw JSON with 'issues' and 'nextPageToken'
+    )
+    page_issues = resp.get("issues", [])
+    issues.extend(page_issues)
+    next_token = resp.get("nextPageToken")
+    if not next_token:
+      break
+
   return [
     {
       "issue_key": issue.key,

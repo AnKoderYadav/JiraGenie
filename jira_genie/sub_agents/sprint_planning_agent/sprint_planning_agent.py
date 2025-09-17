@@ -16,32 +16,83 @@ class SprintPlanningAgent:
         """
         Fetch all backlog tasks from JIRA for a given project and convert them to the required format for sprint planning.
         project_key: JIRA project key (e.g., SCRUM)
+        To calculate the number of Backlogs issues for a given project:
+        'project = {project_key} AND sprint IS EMPTY AND status IN ("To Do", "Open" , "IN REVIEW" ,"ON HOLD")'
+
+        sprint should be Empty and status should be one of these ("To Do", "Open" , "IN REVIEW" ,"ON HOLD")'
         Returns: List of dicts with keys: story_points, type, priority_score, complexity, dependencies
         """
         if not self.jira:
             return []
+       
         try:
-            jql_query = f'project = {project_key} AND sprint IS EMPTY AND status IN ("To Do", "Open")'
-            issues = self.jira.search_issues(jql_query, maxResults=1000)
+            jql_query = f'project = {project_key} AND sprint IS EMPTY AND status IN ("To Do", "Open" , "IN REVIEW" ,"ON HOLD")'
+            # issues = self.jira.search_issues(jql_query, maxResults=1000)
+            issues = []
+            next_token = None
+
+            while True:
+                resp = self.jira.enhanced_search_issues(
+                    jql_str=jql_query,
+                    nextPageToken=next_token,
+                    maxResults=100,
+                    json_result=True  # returns raw JSON with 'issues' and 'nextPageToken'
+                )
+                page_issues = resp.get("issues", [])
+                issues.extend(page_issues)
+                next_token = resp.get("nextPageToken")
+                if not next_token:
+                    break
+
             backlog_items = []
+            print(f"Count of Backlog issues: {len(issues)}")
+
             for issue in issues:
-                fields = issue.fields
-                # Extract fields, adjust field names as per your JIRA config
-                story_points = getattr(fields, 'customfield_10016', 0)  # Change customfield_10016 to your Story Points field
-                issue_type = getattr(fields.issuetype, 'name', 'task').lower()
-                priority_score = getattr(fields.priority, 'id', 2)  # Use priority id or map as needed
-                complexity = getattr(fields, 'complexity', 'medium')  # Adjust if you have a custom field
-                dependencies = len(getattr(fields, 'issuelinks', []))
-                backlog_items.append({
-                    'story_points': int(story_points) if story_points else 0,
-                    'type': issue_type,
-                    'priority_score': int(priority_score),
-                    'complexity': str(complexity).lower(),
-                    'dependencies': dependencies
-                })
+              fields = issue.get("fields") or {}   # ensure dict, even if None
+
+              # Story points
+              story_points = fields.get("customfield_10016") or 0
+
+              # Issue type
+              issue_type = (fields.get("issuetype") or {}).get("name", "task").lower()
+
+              # Priority (null-safe)
+              priority = fields.get("priority") or {}
+              priority_score = int(priority.get("id", 2))
+
+              # Complexity (custom field, safe fallback)
+              complexity = str(fields.get("complexity") or "medium").lower()
+
+              # Dependencies
+              dependencies = len(fields.get("issuelinks") or [])
+
+              backlog_items.append({
+                  "story_points": int(story_points),
+                  "type": issue_type,
+                  "priority_score": priority_score,
+                  "complexity": complexity,
+                  "dependencies": dependencies,
+              })
+
+            # for issue in issues:
+            #   fields = issue["fields"]
+            #   # Extract fields, adjust field names as per your JIRA config
+            #   story_points = fields.get('customfield_10016', 0)  # Change customfield_10016 to your Story Points field
+            #   issue_type = fields.get('issuetype', {}).get('name', 'task').lower()
+            #   priority_score = fields.get('priority', {}).get('id', 2)  # Use priority id or map as needed
+            #   complexity = fields.get('complexity', 'medium')  # Adjust if you have a custom field
+            #   dependencies = len(fields.get('issuelinks', []))
+            #   backlog_items.append({
+            #       'story_points': int(story_points) if story_points else 0,
+            #       'type': issue_type,
+            #       'priority_score': int(priority_score),
+            #       'complexity': str(complexity).lower(),
+            #       'dependencies': dependencies
+            #   })
             return backlog_items
         except Exception as e:
-            return []
+          print(f"ERROR: Skipping issue {issue.get('key')} due to error: {e}")
+          return []
     """
     AI-powered Sprint Planning Agent
     - Velocity prediction using machine learning
