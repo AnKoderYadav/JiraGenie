@@ -61,14 +61,14 @@ def fetch_issues(
 
   return [
     {
-      "issue_key": issue.key,
-      "issue_summary": issue.fields.summary,
-      "issue_description": issue.fields.description or "",
-      "issue_priority": issue.fields.priority.name if issue.fields.priority else "None",
-      "issue_status": issue.fields.status.name if issue.fields.status else "Unknown", 
-      "issue_assignee": issue.fields.assignee.displayName if issue.fields.assignee else "Unassigned",
-      "issue_created": issue.fields.created,
-      "issue_reporter": issue.fields.reporter.displayName if issue.fields.reporter else "Unknown",
+      "issue_key": issue['key'],
+      "issue_summary": issue['fields']['summary'],
+      "issue_description": issue['fields']['description'] or "",
+      # "issue_priority": issue.fields.priority.name if issue.fields.priority else "None",
+      # "issue_status": issue.fields.status.name if issue.fields.status else "Unknown", 
+      # "issue_assignee": issue.fields.assignee.displayName if issue.fields.assignee else "Unassigned",
+      # "issue_created": issue.fields.created,
+      # "issue_reporter": issue.fields.reporter.displayName if issue.fields.reporter else "Unknown",
     } for issue in issues
   ]
 
