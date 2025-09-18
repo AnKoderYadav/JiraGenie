@@ -68,12 +68,19 @@ def set_sla_to_issue(issue_key: str, sla_details: dict) -> dict:
     'customfield_10061': sla_details.get('escalation_critical', ''),  # Escalation Critical
     'customfield_10059': sla_details.get('status', 'unknown')  # SLA Status
   }
-  issue.update(fields=custom_fields)
-  return {
-    "issue_key": issue.key,
-    "sla_details": sla_details,
-    "message": f"SLA details updated for issue {issue.key}."
-  }
+  try:
+    issue.update(fields=custom_fields)
+    return {
+      "issue_key": issue.key,
+      "sla_details": sla_details,
+      "message": f"SLA details updated for issue {issue.key}."
+    }
+  except Exception as e:
+    return {
+      "issue_key": issue.key,
+      "message": "Unable to set fields in JIRA Issue",
+      "error": f"Fields are missing: {e}"
+    }
 
 issue_sla_agent = LlmAgent(
   name="issue_sla_agent",

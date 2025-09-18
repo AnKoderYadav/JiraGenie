@@ -67,6 +67,7 @@ class SprintPlanningAgent:
               dependencies = len(fields.get("issuelinks") or [])
 
               backlog_items.append({
+                  'key': issue["key"],
                   "story_points": int(story_points),
                   "type": issue_type,
                   "priority_score": priority_score,
@@ -222,180 +223,171 @@ class SprintPlanningAgent:
             return "High risk of incomplete sprint. Recommend significant scope reduction."
  
  
-    def optimize_story_distribution(self, backlog_items: List[Dict[str, object]], team_capacity: int, sprint_duration: int = 2) -> dict:
+    def optimize_story_distribution(
+
+        self,
+
+        backlog_items: Optional[List[Dict[str, object]]] = None,
+
+        team_capacity: int = 20,
+
+        project_key: Optional[str] = None,
+
+        sprint_duration: int = 2
+
+    ) -> dict:
+
         """
-        backlog_items: a Python list of dicts, each item with keys:
-            - story_points (int)
-            - type (str)
-            - priority_score (int)
-            - complexity (str) -> expected 'simple'|'medium'|'complex'
-            - dependencies (int)
+
+        Optimize story distribution into a sprint plan based on backlog items and team capacity.
+    
+        Args:
+
+            backlog_items: List of backlog item dicts (from Jira). If None, will fetch using project_key.
+
+            team_capacity: Maximum story points the team can deliver in the sprint.
+
+            project_key: Jira project key (used if backlog_items not provided).
+
+            sprint_duration: Sprint length in weeks (optional, default=2).
+    
+        Returns:
+
+            dict containing:
+
+                - selected_items: list of Jira issue keys chosen for the sprint
+
+                - total_story_points: int, total points of selected items
+
+                - capacity_utilization: % of capacity used
+
+                - risk_level: low/medium/high based on dependencies + utilization
+
+                - success_probability: estimated %
+
+                - recommendations: list of suggestions
+
+                - mitigation_plan: string
+
         """
+
         try:
-            if not isinstance(backlog_items, list):
-                return {'error': 'backlog_items must be a Python list of dicts', 'fallback_capacity': team_capacity}
- 
-            # --- Normalize + validate items ---
+
+            # --- Fetch backlog from Jira if not provided ---
+
+            if not backlog_items:
+
+                if not project_key:
+
+                    return {"error": "Either backlog_items or project_key must be provided"}
+
+                backlog_items = self.fetch_jira_backlog_items(project_key)
+    
+            if not backlog_items:
+
+                return {"error": "No backlog items available to optimize"}
+    
+            # --- Normalize items ---
+
             normalized = []
-            for idx, it in enumerate(backlog_items):
-                if not isinstance(it, dict):
-                    return {'error': f'backlog_items[{idx}] is not an object/dict', 'fallback_capacity': team_capacity}
+
+
+
+            for it in backlog_items:
+
+                sp = it.get("story_points")
+                if sp in (None, 0, ""):  # default to 4 if not provided or 0
+                    sp = 4
+
                 normalized.append({
-                    'story_points': int(it.get('story_points', 0) or 0),
-                    'type': str(it.get('type', 'other') or 'other').lower(),
-                    'priority_score': int(it.get('priority_score', 0) or 0),
-                    'complexity': str(it.get('complexity', 'medium') or 'medium').lower(),
-                    'dependencies': int(it.get('dependencies', 0) or 0),
-                    # preserve original item for return if you want
-                    '_orig': it
+
+                    "key": it.get("key"),
+
+                    "story_points": int(sp),
+
+                    "type": str(it.get("type", "other") or "other").lower(),
+
+                    "priority_score": int(it.get("priority_score", 0) or 0),
+
+                    "complexity": str(it.get("complexity", "medium") or "medium").lower(),
+
+                    "dependencies": int(it.get("dependencies", 0) or 0),
+
+                    "_orig": it
+
                 })
- 
-            # --- Sort: highest priority first; for same priority prefer smaller or larger story points
-            # Current behavior: sort by (priority_score desc, story_points asc)
+    
+            # --- Sort backlog: high priority, low deps first ---
+
             sorted_items = sorted(
+
                 normalized,
-                key=lambda x: (x['priority_score'], -x['story_points']),
-                reverse=True
+
+                key=lambda x: (-x["priority_score"], x["dependencies"], -x["story_points"])
+
             )
- 
-            selected_items: List[Dict] = []
-            total_points = 0
-            risk_score = 0.0
- 
-            story_types = {'bugs': 0, 'features': 0, 'tasks': 0, 'other': 0}
-            complexity_distribution = {'simple': 0, 'medium': 0, 'complex': 0}
- 
-            # helper fallbacks
-            has_calc_risk = hasattr(self, '_calculate_item_risk')
-            has_balance = hasattr(self, '_analyze_sprint_balance')
-            has_get_risk_level = hasattr(self, '_get_risk_level')
-            has_recs = hasattr(self, '_get_distribution_recommendations')
- 
+    
+            # --- Select items until capacity is reached ---
+
+            selected_items, total_points = [], 0
+
             for item in sorted_items:
-                sp = item['story_points']
-                itype = item['type']
-                comp = item['complexity']
-                deps = item['dependencies']
- 
-                if total_points + sp <= team_capacity:
+
+                if total_points + item["story_points"] <= team_capacity:
+
                     selected_items.append(item)
-                    total_points += sp
- 
-                    # type counting
-                    if itype in story_types:
-                        story_types[itype] += 1
-                    else:
-                        # map common synonyms
-                        if itype == 'bug':
-                            story_types['bugs'] += 1
-                        elif itype in ('story', 'feature', 'enhancement', 'new feature'):
-                            story_types['features'] += 1
-                        elif itype in ('task', 'sub-task', 'subtask'):
-                            story_types['tasks'] += 1
-                        else:
-                            story_types['other'] += 1
- 
-                    # complexity distribution normalize to our keys
-                    if comp in ('simple', 'easy', 'small'):
-                        complexity_distribution['simple'] += 1
-                        complexity_key = 'simple'
-                    elif comp in ('complex', 'hard', 'large'):
-                        complexity_distribution['complex'] += 1
-                        complexity_key = 'complex'
-                    else:
-                        complexity_distribution['medium'] += 1
-                        complexity_key = 'medium'
- 
-                    # item risk
-                    if has_calc_risk:
-                        try:
-                            item_risk = float(self._calculate_item_risk(item))
-                        except Exception:
-                            item_risk = 0.0
-                    else:
-                        # fallback heuristic: complexity weight + dependency factor + SP relative term
-                        comp_weight = {'simple': 0.5, 'medium': 1.0, 'complex': 2.0}.get(complexity_key, 1.0)
-                        dep_weight = deps * 0.5
-                        size_weight = sp / max(1, team_capacity)  # small contribution
-                        item_risk = comp_weight + dep_weight + size_weight
- 
-                    risk_score += item_risk
- 
-            # --- Balance analysis (use helper if available) ---
-            if has_balance:
-                try:
-                    balance_score = self._analyze_sprint_balance(story_types, complexity_distribution, total_points, team_capacity)
-                except Exception:
-                    balance_score = {'score': 0, 'note': 'balance analyzer failed'}
-            else:
-                # Simple fallback balance: closer to balanced counts and <= capacity => good score
-                type_counts = [v for k, v in story_types.items() if k != 'other']
-                type_variation = 0.0
-                if type_counts:
-                    mean_count = sum(type_counts) / len(type_counts)
-                    type_variation = sum(abs(c - mean_count) for c in type_counts) / max(1.0, mean_count)
-                capacity_ratio = (total_points / team_capacity) if team_capacity > 0 else 0
-                balance_score = {'score': round(100 - min(100, type_variation * 10 + abs(0.8 - capacity_ratio) * 100), 1)}
- 
-            # --- Risk aggregation and level ---
-            selected_count = len(selected_items)
-            overall_risk = round((risk_score / selected_count), 2) if selected_count else 0.0
- 
-            if has_get_risk_level:
-                try:
-                    risk_level = self._get_risk_level(overall_risk)
-                except Exception:
-                    risk_level = 'medium'
-            else:
-                # simple mapping
-                if overall_risk >= 2.0:
-                    risk_level = 'high'
-                elif overall_risk >= 1.0:
-                    risk_level = 'medium'
-                else:
-                    risk_level = 'low'
- 
-            # --- Recommendations ---
-            if has_recs:
-                try:
-                    recommendations = self._get_distribution_recommendations(story_types, complexity_distribution, total_points, team_capacity)
-                except Exception:
-                    recommendations = []
-            else:
-                recommendations = []
-                if total_points > team_capacity:
-                    recommendations.append("Selected items exceed capacity — deprioritize low-priority items or split stories.")
-                else:
-                    recommendations.append("Plan fits within capacity; keep an eye on complex items and dependencies.")
-                if complexity_distribution['complex'] > max(1, selected_count * 0.25):
-                    recommendations.append("Too many complex items — consider moving some to next sprint or breaking them down.")
- 
-            # --- Capacity utilization safe calc ---
-            capacity_utilization = round((total_points / team_capacity) * 100, 1) if team_capacity > 0 else 0.0
- 
-            # Build output (strip internal _orig if you prefer)
-            # Optionally return the original items for traceability
-            output_selected = [ {k: v for k, v in s.items() if k != '_orig'} for s in selected_items ]
- 
+
+                    total_points += item["story_points"]
+    
+            utilization = int((total_points / team_capacity) * 100) if team_capacity > 0 else 0
+    
+            # --- Risk assessment ---
+
+            risk_level = "low"
+
+            if utilization > 90 or any(it["dependencies"] > 3 for it in selected_items):
+
+                risk_level = "medium"
+
+            if utilization > 100:
+
+                risk_level = "high"
+    
+            # --- Probability estimate ---
+
+            success_probability = max(30, 100 - abs(team_capacity - total_points) * 5)
+    
             return {
-                'selected_items': output_selected,
-                'total_story_points': total_points,
-                'capacity_utilization': capacity_utilization,
-                'story_distribution': story_types,
-                'complexity_distribution': complexity_distribution,
-                'risk_assessment': {
-                    'overall_risk': overall_risk,
-                    'risk_level': risk_level
-                },
-                'balance_score': balance_score,
-                'recommendations': recommendations
+
+                "selected_items": [s["key"] for s in selected_items],
+
+                "total_story_points": total_points,
+
+                "capacity_utilization": utilization,
+
+                "risk_level": risk_level,
+
+                "success_probability": success_probability,
+
+                "recommendations": [
+
+                    "Prioritize high-value, low-dependency stories.",
+
+                    "Keep sprint load close to velocity range.",
+
+                    "Watch out for items with many dependencies."
+
+                ],
+
+                "mitigation_plan": "Split large stories; reassign high-dependency items."
+
             }
- 
+    
         except Exception as e:
-            return {
-                'error': str(e),
-                'fallback_capacity': team_capacity
-            }
+
+            return {"error": str(e)}
+
+ 
  
     def _calculate_item_risk(self, item: dict) -> float:
         """Calculate risk score for individual item"""
@@ -610,20 +602,79 @@ class SprintPlanningAgent:
             name="sprint_planning_agent",
             model="gemini-2.0-flash",
             description="AI agent for intelligent sprint planning with velocity prediction and optimal story distribution",
-            instruction="""You are an expert sprint planning agent with advanced ML capabilities. Your expertise includes:
- 
-            1. VELOCITY PREDICTION: Use machine learning to predict team velocity based on historical data and current factors
-            2. OPTIMAL DISTRIBUTION: Balance story points across different types of work for maximum team efficiency  
-            3. RISK ASSESSMENT: Identify potential sprint risks and provide mitigation strategies
- 
-            Key capabilities:
-            - Analyze historical sprint data to predict future performance
-            - Optimize story selection based on capacity and priorities
-            - Balance bugs, features, and technical tasks
-            - Consider team size, complexity, and external factors
-            - Provide data-driven recommendations for sprint success
- 
-            Always provide confidence intervals and explain the reasoning behind predictions.""",
+            instruction="""
+            You are an expert Sprint Planning Agent with strong expertise in Agile methodologies, project management, and advanced machine learning for predictive analysis. 
+            Your primary responsibility is to assist teams in planning effective and realistic sprints by leveraging historical data, workload balancing strategies, and risk awareness.
+            Conisder Story points for each backlog issue to be 4.
+
+            CORE CAPABILITIES:
+            1. VELOCITY PREDICTION:
+            - Analyze historical sprint data to forecast the team’s velocity.
+            - Adjust predictions based on current sprint variables (e.g., team size, availability, complexity).
+            - Provide confidence intervals (e.g., 80% likely to complete 25–30 story points).
+            - Highlight factors that may impact the prediction (holidays, team changes, technical debt, blockers).
+
+            2. OPTIMAL STORY DISTRIBUTION:
+            - Recommend how to best allocate stories across different work categories (features, bugs, technical debt, spikes).
+            - Ensure workload balance across team members while considering specialization and skillsets.
+            - Optimize based on business priority, risk assessment, risk balance and available capacity.
+            - Identify risks in sprint planning (overcommitment, underutilization, critical dependencies, or unclear requirements).
+            - Provide early warnings about likely bottlenecks.
+            - Recommend mitigation strategies to reduce risk and improve delivery confidence.
+            - Returns list of backlogs issues to include according to the sprint plan based on SELECTION STRATEGY
+            - SELECTION STRATEGY to include issues in the Sprint:
+                1. **Category Distribution (Work Type Mix)**:
+                - Maintain approximate work allocation of:
+                    - 60% Bugs
+                    - 15% Features
+                    - 25% Tasks
+                - These ratios guide workload balancing but may flex when spillovers or critical items exist.
+                - For Example: If we have calculated capacity to be 60, which can include let's say 20 issues, so 60% of 12 i.e 12 bugs, likewise 5 tasks and 3 features.
+
+                2. **Ticket Age Consideration**:
+                - Any ticket older than 1 month takes precedence over newer tickets,
+                    regardless of its assigned priority level.
+                - Ensures stale or long-pending work is addressed promptly.
+
+                3. **Priority-Based Ordering**:
+                - Within each category, select tickets in order of priority:
+                    - High → Medium → Low
+                - Priorities are only overridden if the ticket age rule applies.
+
+                4. **Velocity Alignment**:
+                - The number of tickets selected must align with the team’s historical velocity (average story points completed per sprint).
+                - Prevents overcommitment and ensures sprint commitments are realistic.
+
+                5. **Spillover Handling**:
+                - Tickets that spill over from previous sprints must be counted first towards the velocity limit before adding new tickets.
+                - Spillovers retain their original priority and category but are considered mandatory inclusions.
+
+            3. CREATE SPRINT PLAIN:
+            - Identify risks in sprint planning (overcommitment, underutilization, critical dependencies, or unclear requirements).
+            - Provide early warnings about likely bottlenecks.
+            - Recommend mitigation strategies to reduce risk and improve delivery confidence.
+
+            KEY TOOLS (Agent Functions):
+            - **predict_velocity**:
+            Input: Historical sprint data, team availability, and current sprint context.
+            Output: Predicted velocity with confidence range, plus reasoning for the prediction.
+            Usage: Helps set realistic sprint goals and avoids over/under commitment.
+
+            - **optimize_story_distribution**:
+            Input: List of candidate stories with estimates, priorities, and categories.
+            Output: Optimized distribution of stories across work types and/or team members.
+            Usage: Ensures fair and efficient workload balancing while aligning with business objectives.
+
+            - **create_sprint_plan**:
+            Input: Predicted velocity, optimized story distribution, and business priorities.
+            Output: A complete sprint plan including selected stories, workload distribution, identified risks, and confidence levels.
+            Usage: Provides a holistic, data-driven sprint plan ready for review and execution.
+
+            INTERACTION STYLE:
+            - Always explain reasoning and assumptions behind recommendations.
+            - Present results in clear, structured, and actionable formats (tables, bullet points, or summaries).
+            - When uncertain, state limitations and suggest ways to gather missing data.
+            - Balance quantitative predictions (ML-based) with qualitative insights (Agile best practices).""",
             tools=[
                 FunctionTool(self.predict_velocity),
                 FunctionTool(self.optimize_story_distribution),
